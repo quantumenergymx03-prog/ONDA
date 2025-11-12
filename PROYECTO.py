@@ -14,6 +14,7 @@ import matplotlib
 import re
 import joblib
 import warnings
+from scipy.signal import butter, filtfilt
 import json
 import textwrap
 matplotlib.use("Agg")
@@ -70,6 +71,96 @@ PATH_PAT_KEYS = IA_DIR / "model_patterns" / "feature_keys.json"
 ISO_THRESHOLDS = (2.8, 4.5, 7.1)  # A, B, C mm/s (ajusta si aplica)
 ANALYSIS_WINDOW_SECONDS = 3.0
 GRAVITY_M_S2 = 9.80665
+
+FILTER_NOTE_TEXT = (
+    "Las señales mostradas fueron filtradas alrededor de la frecuencia fundamental de rotación (1X), "
+    "con el fin de resaltar el movimiento principal del rotor y mejorar la comprensión visual del gráfico. "
+    "Este filtrado no altera el diagnóstico ni la clasificación ISO/ML."
+)
+
+
+def filtrar_1x(
+    signal: np.ndarray | Sequence[float],
+    fs: Optional[float],
+    *,
+    rpm: Optional[float] = None,
+    f1_hz: Optional[float] = None,
+    ancho_rel: float = 0.25,
+    orden: int = 4,
+) -> np.ndarray:
+    """Filtra una señal alrededor de 1X mediante un filtro pasabanda Butterworth."""
+
+    arr = np.asarray(signal, dtype=float)
+    if arr.size == 0:
+        return arr.copy()
+
+    try:
+        fs_val = float(fs) if fs is not None else 0.0
+    except Exception:
+        fs_val = 0.0
+    if not np.isfinite(fs_val) or fs_val <= 0:
+        return arr.copy()
+
+    freq_1x = None
+    if rpm is not None:
+        try:
+            rpm_val = float(rpm)
+        except Exception:
+            rpm_val = None
+        if rpm_val is not None and np.isfinite(rpm_val) and rpm_val > 0:
+            freq_1x = rpm_val / 60.0
+    if freq_1x is None and f1_hz is not None:
+        try:
+            f1_val = float(f1_hz)
+        except Exception:
+            f1_val = None
+        if f1_val is not None and np.isfinite(f1_val) and f1_val > 0:
+            freq_1x = f1_val
+    if freq_1x is None or freq_1x <= 0:
+        return arr.copy()
+
+    nyquist = fs_val / 2.0
+    if not np.isfinite(nyquist) or nyquist <= 0 or freq_1x >= nyquist:
+        return arr.copy()
+
+    try:
+        ancho = float(ancho_rel)
+    except Exception:
+        ancho = 0.25
+    if not np.isfinite(ancho) or ancho <= 0:
+        ancho = 0.25
+
+    low_hz = max(0.0, freq_1x * (1.0 - ancho))
+    high_hz = max(0.0, freq_1x * (1.0 + ancho))
+    if high_hz <= 0:
+        return arr.copy()
+    if high_hz >= nyquist:
+        high_hz = nyquist * 0.999
+    if low_hz <= 0:
+        low_hz = max(high_hz * 0.05, freq_1x * 0.25, 0.1)
+    if not (0 < low_hz < high_hz < nyquist):
+        return arr.copy()
+
+    wn_low = low_hz / nyquist
+    wn_high = high_hz / nyquist
+    wn_low = min(max(wn_low, 1e-4), 0.99)
+    wn_high = min(max(wn_high, wn_low + 1e-4), 0.999)
+    if not (0 < wn_low < wn_high < 1):
+        return arr.copy()
+
+    try:
+        order = int(max(1, orden))
+    except Exception:
+        order = 4
+
+    try:
+        b, a = butter(order, [wn_low, wn_high], btype="bandpass")
+        filtered = filtfilt(b, a, arr)
+        return np.asarray(filtered, dtype=float)
+    except ValueError:
+        return arr.copy()
+    except Exception:
+        return arr.copy()
 
 _SEVERITY_MODEL: Optional[Any] = None
 _PATTERN_MODEL: Optional[Any] = None
@@ -2157,6 +2248,8 @@ class MainApp:
         self._fft_zoom_syncing = False
         self._fft_display_scale: float = 1.0
         self._fft_display_unit: str = "Hz"
+        self._last_dom_freq: Optional[float] = None
+        self._last_segment_fs: Optional[float] = None
         self.trend_series_field: Optional[ft.TextField] = None
         self.trend_axis_field: Optional[ft.TextField] = None
         self.trend_note_field: Optional[ft.TextField] = None
@@ -8794,22 +8887,51 @@ class MainApp:
                 except Exception:
                     dt = None
 
+            fs_local = None
+            if dt is not None and np.isfinite(dt) and dt > 0:
+                fs_local = 1.0 / dt
+            try:
+                f1_hz_guess = self._get_1x_hz(getattr(self, "_last_dom_freq", None))
+            except Exception:
+                f1_hz_guess = None
+            filter_possible = (
+                fs_local is not None
+                and np.isfinite(fs_local)
+                and fs_local > 0
+                and f1_hz_guess is not None
+                and np.isfinite(f1_hz_guess)
+                and f1_hz_guess > 0
+                and f1_hz_guess < (fs_local / 2.0)
+            )
+            orbit_filter_applied = bool(filter_possible)
+            orbit_filter_warning = None if filter_possible else "No se pudo aplicar el filtrado 1X (verifica RPM y muestreo)."
+
             def _band_filter(arr: np.ndarray) -> np.ndarray:
+                nonlocal orbit_filter_applied, orbit_filter_warning
                 base = np.asarray(arr, dtype=float)
                 base = base - np.nanmean(base)
                 base = np.nan_to_num(base, nan=0.0, posinf=0.0, neginf=0.0)
-                if dt is None or base.size < 32:
-                    return base
-                spec = np.fft.rfft(base)
-                freqs = np.fft.rfftfreq(base.size, dt)
+                result = base.copy()
+                if filter_possible and base.size >= 32 and fs_local is not None:
+                    try:
+                        result = filtrar_1x(result, fs_local, f1_hz=f1_hz_guess)
+                        orbit_filter_applied = True
+                    except Exception:
+                        orbit_filter_applied = False
+                        orbit_filter_warning = "No se pudo aplicar el filtrado 1X (verifica RPM y muestreo)."
+                        result = base.copy()
+                if dt is None or result.size < 32:
+                    return result
+                spec = np.fft.rfft(result)
+                freqs = np.fft.rfftfreq(result.size, dt)
                 if hide_lf and fc and fc > 0:
                     spec[freqs < max(0.0, float(fc))] = 0
                 if fmax_ui and fmax_ui > 0:
                     spec[freqs > float(fmax_ui)] = 0
                 try:
-                    filtered = np.fft.irfft(spec, n=base.size)
+                    filtered = np.fft.irfft(spec, n=result.size)
                 except Exception:
-                    filtered = base
+                    filtered = result
                 return filtered
 
             def _smooth_signal(arr: np.ndarray, samples: int) -> np.ndarray:
@@ -8901,6 +9023,15 @@ class MainApp:
                 kernel = kernel / np.sum(kernel)
                 x_plot = np.convolve(x_plot, kernel, mode="same")
                 y_plot = np.convolve(y_plot, kernel, mode="same")
+
+            x_raw_centered, y_raw_centered = _center_curve(x_orig, y_orig)
+            raw_plot_x, raw_plot_y, _, _ = _resample_path(x_raw_centered, y_raw_centered)
+            if raw_plot_x.size >= 11:
+                kernel_raw = np.ones(11, dtype=float)
+                kernel_raw = kernel_raw / np.sum(kernel_raw)
+                raw_plot_x = np.convolve(raw_plot_x, kernel_raw, mode="same")
+                raw_plot_y = np.convolve(raw_plot_y, kernel_raw, mode="same")
+
             overlay_original = False
             balance_note = None
             corr_val = None
@@ -8999,20 +9130,58 @@ class MainApp:
                 except Exception:
                     return hex_color
             face = "#0f141b" if dark_mode else "white"
-            fig, ax = plt.subplots(figsize=(6.4, 5.9))
+            fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.9))
             fig.patch.set_facecolor(face)
-            ax.set_facecolor(face)
+            ax_raw, ax = axes
+            for axis in axes:
+                axis.set_facecolor(face)
             accent = _tone_color(shape_color if shape_color else self._accent_ui(), dark_mode, blend=0.2)
-            if overlay_original:
+            raw_color = _tone_color("#95a5a6", dark_mode, blend=0.25)
+            if raw_plot_x.size and raw_plot_y.size:
+                ax_raw.plot(raw_plot_x, raw_plot_y, color=raw_color, linewidth=1.15, alpha=0.9)
+            ax_raw.set_title("Señal original: incluye todos los armónicos y ruido")
+            ax_raw.set_xlabel(x_label or "Canal X")
+            ax_raw.set_ylabel(y_label or "Canal Y")
+            ax_raw.set_aspect("equal")
+            radial_raw = np.hypot(raw_plot_x, raw_plot_y)
+            try:
+                span_raw = float(np.nanpercentile(np.abs(radial_raw), 99.5))
+            except Exception:
+                span_raw = float(np.nanmax(radial_raw)) if radial_raw.size else 0.0
+            if not np.isfinite(span_raw) or span_raw <= 0:
+                span_raw = float(np.nanmax(radial_raw)) if radial_raw.size else 1.0
+            lim_raw = float(span_raw) * 1.1 if span_raw > 0 else 1.0
+            ax_raw.set_xlim(-lim_raw, lim_raw)
+            ax_raw.set_ylim(-lim_raw, lim_raw)
+            raw_axis_color = "white" if dark_mode else "black"
+            ax_raw.axhline(0.0, color=raw_axis_color, linewidth=0.8, alpha=0.2)
+            ax_raw.axvline(0.0, color=raw_axis_color, linewidth=0.8, alpha=0.2)
+            raw_grid_color = "#34495e" if dark_mode else "#bdc3c7"
+            ax_raw.grid(True, linestyle="--", alpha=0.2 if dark_mode else 0.3, color=raw_grid_color)
+            ax_raw.xaxis.label.set_color(raw_axis_color)
+            ax_raw.yaxis.label.set_color(raw_axis_color)
+            ax_raw.title.set_color(raw_axis_color)
+            for axis in [ax_raw.xaxis, ax_raw.yaxis]:
+                for tick in axis.get_ticklabels():
+                    tick.set_color(raw_axis_color)
+
+            if raw_plot_x.size and raw_plot_y.size:
                 ax.plot(
-                    x_orig,
-                    y_orig,
-                    color="#95a5a6",
-                    linewidth=0.9,
-                    alpha=0.5,
-                    label="Original (sin balance)",
+                    raw_plot_x,
+                    raw_plot_y,
+                    color=_tone_color("#7f8c8d", dark_mode, blend=0.35),
+                    linewidth=0.8,
+                    alpha=0.35,
+                    label="Señal original (referencia)",
                 )
-            ax.plot(x_plot, y_plot, color=accent, linewidth=1.6, alpha=0.95)
+            ax.plot(
+                x_plot,
+                y_plot,
+                color=accent,
+                linewidth=1.6,
+                alpha=0.95,
+                label="Señal filtrada 1X (rotación fundamental)",
+            )
             sc = ax.scatter(
                 x_plot,
                 y_plot,
@@ -9057,7 +9226,7 @@ class MainApp:
                 ax.scatter([x_plot[-1]], [y_plot[-1]], color=end_color, s=54, label="Fin")
             except Exception:
                 pass
-            ax.set_title("Análisis de órbita")
+            ax.set_title("Señal filtrada 1X: componente fundamental del rotor")
             ax.set_xlabel(x_label or "Canal X")
             ax.set_ylabel(y_label or "Canal Y")
             ax.set_aspect("equal")
@@ -9086,10 +9255,10 @@ class MainApp:
                     tick.set_color(axis_color)
             headline = f"Forma detectada: {shape_label} — {shape_detail}"
             wrapped_headline = "\n".join(textwrap.wrap(headline, width=70))
-            fig.subplots_adjust(left=0.12, right=0.96, top=0.84, bottom=0.24)
+            fig.subplots_adjust(left=0.08, right=0.96, top=0.82, bottom=0.2, wspace=0.28)
             fig.text(
                 0.5,
-                0.89,
+                0.86,
                 wrapped_headline,
                 ha="center",
                 va="bottom",
@@ -9100,7 +9269,7 @@ class MainApp:
             legend_text = "Forma: circular=balanceo | elíptica=desalineación | 8=holgura"
             fig.text(
                 0.5,
-                0.09,
+                0.12,
                 legend_text,
                 ha="center",
                 va="bottom",
@@ -9108,10 +9277,11 @@ class MainApp:
                 fontsize=8,
             )
             if balance_note:
-                fig.text(
+                ax.text(
                     0.5,
-                    0.14,
+                    1.02,
                     balance_note,
+                    transform=ax.transAxes,
                     ha="center",
                     va="bottom",
                     fontsize=7,
@@ -9123,7 +9293,26 @@ class MainApp:
                         edgecolor="none",
                     ),
                 )
-            cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.015)
+            fig.text(
+                0.5,
+                0.05,
+                FILTER_NOTE_TEXT,
+                ha="center",
+                va="bottom",
+                color=axis_color,
+                fontsize=8,
+            )
+            if orbit_filter_warning:
+                fig.text(
+                    0.5,
+                    0.02,
+                    orbit_filter_warning,
+                    ha="center",
+                    va="bottom",
+                    color="#f39c12",
+                    fontsize=8,
+                )
+            cbar = fig.colorbar(sc, ax=ax, shrink=0.78, pad=0.02)
             cbar.set_label("Progreso temporal")
             if dark_mode:
                 cbar.ax.yaxis.label.set_color("white")
@@ -10136,12 +10325,24 @@ class MainApp:
             # 🔥 PASO 3: Asegurarse de que el DataFrame para el segmento también sea el limpio.
             segment_df = df_limpio.iloc[segment_idx]
 
-            t_segment, acc_segment, _, _ = self._prepare_segment_for_analysis(t_segment_raw, signal_segment_raw, fft_signal_col)
+            t_segment, acc_segment, dt_segment, _ = self._prepare_segment_for_analysis(
+                t_segment_raw,
+                signal_segment_raw,
+                fft_signal_col,
+            )
             try:
                 print(f"[DEBUG] Primeros valores acc_segment ({fft_signal_col}): {acc_segment[:5]}")
             except Exception:
                 pass
-            
+
+            fs_segment = None
+            try:
+                if dt_segment is not None and np.isfinite(dt_segment) and dt_segment > 0:
+                    fs_segment = 1.0 / float(dt_segment)
+            except Exception:
+                fs_segment = None
+            self._last_segment_fs = fs_segment
+
             # ... El resto de tu función continúa exactamente igual desde aquí ...
             # ... No necesitas cambiar nada más en el resto de la función ...
 
@@ -10242,6 +10443,10 @@ class MainApp:
             selected_rms_mm = res['severity']['rms_mm_s']
             selected_label = res['severity']['label']
             selected_color = res['severity']['color']
+            try:
+                self._last_dom_freq = float(dom_freq) if dom_freq is not None else None
+            except Exception:
+                self._last_dom_freq = None
             axis_summaries, primary_entry = self._compute_axis_severity(
                 time_col,
                 mask,
@@ -10427,6 +10632,42 @@ class MainApp:
             self._last_accseg = acc_segment
 
 
+
+            # --- Preparación de señales filtradas para visualización ---
+
+            try:
+                f1_hz_guess = self._get_1x_hz(dom_freq)
+            except Exception:
+                f1_hz_guess = None
+            _y_time_filtered = np.array(_y_time, dtype=float, copy=True)
+            time_filter_applied = False
+            filter_warning_note = None
+            if (
+                _y_time_filtered.size > 0
+                and fs_segment is not None
+                and np.isfinite(fs_segment)
+                and fs_segment > 0
+                and f1_hz_guess is not None
+                and np.isfinite(f1_hz_guess)
+                and f1_hz_guess > 0
+                and f1_hz_guess < (fs_segment / 2.0)
+            ):
+                try:
+                    _y_time_filtered = filtrar_1x(
+                        _y_time_filtered,
+                        fs_segment,
+                        rpm=rpm_val,
+                        f1_hz=f1_hz_guess,
+                    )
+                    time_filter_applied = True
+                except Exception:
+                    time_filter_applied = False
+                    _y_time_filtered = np.array(_y_time, dtype=float, copy=True)
+            else:
+                filter_warning_note = "No se pudo aplicar el filtrado 1X (verifica RPM y muestreo)."
+
+            if not time_filter_applied and filter_warning_note is None:
+                filter_warning_note = "No se pudo aplicar el filtrado 1X (verifica RPM y muestreo)."
 
             # --- Gráficas principales ---
 
@@ -10615,22 +10856,36 @@ class MainApp:
 
             def _build_matplotlib_time_freq_chart() -> Optional[MatplotlibChart]:
                 try:
-                    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=False)
+                    fig, axes = plt.subplots(
+                        3,
+                        1,
+                        figsize=(12, 9),
+                        sharex=False,
+                        gridspec_kw={"height_ratios": [1.0, 1.0, 1.2]},
+                    )
                 except Exception:
                     return None
 
+                ax_raw, ax_filt, ax_spec = axes
                 try:
-                    ax1.plot(t_segment, _y_time, color=self.time_plot_color, linewidth=2)
-                    ax1.set_title(fig_time_title)
-                    ax1.set_xlabel("Tiempo (s)")
-                    ax1.set_ylabel(_ylabel)
+                    ax_raw.plot(
+                        t_segment,
+                        _y_time,
+                        color=self.time_plot_color,
+                        linewidth=2,
+                        label="Señal original",
+                    )
+                    ax_raw.set_title("Señal original: incluye todos los armónicos y ruido")
+                    ax_raw.set_xlabel("Tiempo (s)")
+                    ax_raw.set_ylabel(_ylabel)
+                    ax_raw.legend(loc="upper right")
                     try:
                         text_color = "white" if self.is_dark_mode else "black"
-                        ax1.text(
+                        ax_raw.text(
                             0.02,
                             0.95,
                             _rms_text,
-                            transform=ax1.transAxes,
+                            transform=ax_raw.transAxes,
                             va="top",
                             color=text_color,
                         )
@@ -10640,18 +10895,51 @@ class MainApp:
                     pass
 
                 try:
+                    filtered_color = "#5dade2" if not self.is_dark_mode else "#85c1e9"
+                    ax_filt.plot(
+                        t_segment,
+                        _y_time_filtered,
+                        color=filtered_color,
+                        linewidth=2,
+                        label="Señal filtrada 1X (rotación fundamental)",
+                    )
+                    ax_filt.set_title("Señal filtrada 1X: componente fundamental del rotor")
+                    ax_filt.set_xlabel("Tiempo (s)")
+                    ax_filt.set_ylabel(_ylabel)
+                    ax_filt.legend(loc="upper right")
+                    if not time_filter_applied and filter_warning_note:
+                        warn_color = "#f5b041" if not self.is_dark_mode else "#f8c471"
+                        ax_filt.text(
+                            0.02,
+                            0.92,
+                            filter_warning_note,
+                            transform=ax_filt.transAxes,
+                            va="top",
+                            color=warn_color,
+                            fontsize=9,
+                        )
+                except Exception:
+                    pass
+
+                try:
                     xplot_disp_local = xplot_disp if xplot_disp is not None else []
                     yplot_local = yplot if yplot is not None else []
-                    ax2.plot(xplot_disp_local, yplot_local, color=self.fft_plot_color, linewidth=2)
-                    ax2.fill_between(xplot_disp_local, yplot_local, alpha=0.3, color=self.fft_plot_color)
-                    ax2.set_title(fig_freq_title)
-                    ax2.set_xlabel(f"Frecuencia ({freq_unit})")
-                    ax2.set_ylabel("Velocidad [mm/s]")
+                    ax_spec.plot(xplot_disp_local, yplot_local, color=self.fft_plot_color, linewidth=2)
+                    ax_spec.fill_between(xplot_disp_local, yplot_local, alpha=0.3, color=self.fft_plot_color)
+                    ax_spec.set_title(fig_freq_title)
+                    ax_spec.set_xlabel(f"Frecuencia ({freq_unit})")
+                    ax_spec.set_ylabel("Velocidad [mm/s]")
                     if yplot_dbv is not None:
                         try:
-                            ax2_db = ax2.twinx()
-                            ax2_db.plot(xplot_disp_local, yplot_dbv, color="#9b59b6", linewidth=1.6, linestyle="--")
-                            ax2_db.set_ylabel("Nivel [dBV]")
+                            ax_spec_db = ax_spec.twinx()
+                            ax_spec_db.plot(
+                                xplot_disp_local,
+                                yplot_dbv,
+                                color="#9b59b6",
+                                linewidth=1.6,
+                                linestyle="--",
+                            )
+                            ax_spec_db.set_ylabel("Nivel [dBV]")
                             lower = db_axis_min
                             upper = db_axis_max
                             if lower is not None or upper is not None:
@@ -10672,41 +10960,57 @@ class MainApp:
                                     and np.isfinite(y_upper)
                                     and y_upper != y_lower
                                 ):
-                                    ax2_db.set_ylim(y_lower, y_upper)
+                                    ax_spec_db.set_ylim(y_lower, y_upper)
                         except Exception:
                             pass
                     if peak_points:
                         try:
                             px, py = zip(*peak_points)
-                            ax2.scatter(px, py, color="#e74c3c", s=30, zorder=5)
-                            self._place_annotations(ax2, peak_points, peak_labels, color="#e74c3c")
+                            ax_spec.scatter(px, py, color="#e74c3c", s=30, zorder=5)
+                            self._place_annotations(ax_spec, peak_points, peak_labels, color="#e74c3c")
                         except Exception:
                             pass
                     if visible_marks:
                         try:
                             for pos, label, color_hex in visible_marks:
                                 try:
-                                    ax2.axvline(pos, color=color_hex, linestyle="--", alpha=0.85, linewidth=1.2)
+                                    ax_spec.axvline(pos, color=color_hex, linestyle="--", alpha=0.85, linewidth=1.2)
                                 except Exception:
                                     continue
                             zoom_scaled = None if zmin is None else (zmin / freq_scale, zmax / freq_scale)
-                            self._draw_frequency_markers(ax2, visible_marks, zoom_scaled)
+                            self._draw_frequency_markers(ax_spec, visible_marks, zoom_scaled)
                         except Exception:
                             pass
                     try:
                         if zmin is not None:
-                            ax2.set_xlim(left=zmin / freq_scale, right=zmax / freq_scale)
+                            ax_spec.set_xlim(left=zmin / freq_scale, right=zmax / freq_scale)
                         elif fmax_ui and fmax_ui > 0:
-                            ax2.set_xlim(left=0.0, right=float(fmax_ui) / freq_scale)
+                            ax_spec.set_xlim(left=0.0, right=float(fmax_ui) / freq_scale)
                     except Exception:
                         pass
                 except Exception:
                     pass
 
                 try:
+                    note_color = "white" if self.is_dark_mode else "black"
+                    fig.text(0.5, 0.04, FILTER_NOTE_TEXT, ha="center", va="center", color=note_color, fontsize=9)
+                    if not time_filter_applied and filter_warning_note:
+                        fig.text(
+                            0.5,
+                            0.015,
+                            filter_warning_note,
+                            ha="center",
+                            va="center",
+                            color="#f39c12",
+                            fontsize=8,
+                        )
+                except Exception:
+                    pass
+
+                try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", UserWarning)
-                        fig.tight_layout()
+                        fig.tight_layout(rect=(0.03, 0.07, 0.97, 0.98))
                 except Exception:
                     pass
 
@@ -10720,11 +11024,12 @@ class MainApp:
                 try:
                     template_name = "plotly_dark" if self.is_dark_mode else "plotly_white"
                     plotly_fig = make_subplots(
-                        rows=2,
+                        rows=3,
                         cols=1,
                         shared_xaxes=False,
-                        vertical_spacing=0.08,
-                        specs=[[{}], [{"secondary_y": True}]],
+                        vertical_spacing=0.06,
+                        row_heights=[0.3, 0.3, 0.4],
+                        specs=[[{}], [{}], [{"secondary_y": True}]],
                     )
     
                     time_hover = "Tiempo: %{x:.3f} s"
@@ -10736,13 +11041,27 @@ class MainApp:
                             y=_y_time,
                             mode="lines",
                             line=dict(color=self.time_plot_color, width=2),
-                            name=fig_time_title,
+                            name="Señal original",
                             hovertemplate=time_hover,
                         ),
                         row=1,
                         col=1,
                     )
-    
+
+                    filtered_color = "#5dade2" if not self.is_dark_mode else "#85c1e9"
+                    plotly_fig.add_trace(
+                        go.Scatter(
+                            x=t_segment,
+                            y=_y_time_filtered,
+                            mode="lines",
+                            line=dict(color=filtered_color, width=2),
+                            name="Señal filtrada 1X (rotación fundamental)",
+                            hovertemplate=time_hover,
+                        ),
+                        row=2,
+                        col=1,
+                    )
+
                     annotation_color = "#ffffff" if self.is_dark_mode else "#000000"
                     plotly_fig.add_annotation(
                         x=0.01,
@@ -10787,7 +11106,7 @@ class MainApp:
                                 customdata=fft_custom,
                                 hovertemplate=fft_hover,
                             ),
-                            row=2,
+                            row=3,
                             col=1,
                             secondary_y=False,
                         )
@@ -10805,7 +11124,7 @@ class MainApp:
                                 hovertext=peak_labels,
                                 hoverinfo="text",
                             ),
-                            row=2,
+                            row=3,
                             col=1,
                             secondary_y=False,
                         )
@@ -10820,7 +11139,7 @@ class MainApp:
                                 name="Nivel [dBV]",
                                 hovertemplate="Frecuencia: %{x:.3f}<br>Nivel: %{y:.2f} dBV<extra></extra>",
                             ),
-                            row=2,
+                            row=3,
                             col=1,
                             secondary_y=True,
                         )
@@ -10839,15 +11158,15 @@ class MainApp:
                                 x1=pos,
                                 y0=0,
                                 y1=fft_ymax,
-                                xref="x2",
-                                yref="y2",
+                                xref="x3",
+                                yref="y3",
                                 line=dict(color=color_hex, dash="dash", width=1.2, opacity=0.85),
                             )
                             plotly_fig.add_annotation(
                                 x=pos,
                                 y=fft_ymax,
-                                xref="x2",
-                                yref="y2",
+                                xref="x3",
+                                yref="y3",
                                 text=label,
                                 showarrow=False,
                                 font=dict(color=color_hex, size=11),
@@ -10856,11 +11175,13 @@ class MainApp:
     
                     plotly_fig.update_xaxes(title_text="Tiempo (s)", row=1, col=1)
                     plotly_fig.update_yaxes(title_text=_ylabel, row=1, col=1)
-                    plotly_fig.update_xaxes(title_text=f"Frecuencia ({freq_unit})", row=2, col=1)
-                    plotly_fig.update_yaxes(title_text="Velocidad [mm/s]", row=2, col=1, secondary_y=False)
-    
+                    plotly_fig.update_xaxes(title_text="Tiempo (s)", row=2, col=1)
+                    plotly_fig.update_yaxes(title_text=_ylabel, row=2, col=1)
+                    plotly_fig.update_xaxes(title_text=f"Frecuencia ({freq_unit})", row=3, col=1)
+                    plotly_fig.update_yaxes(title_text="Velocidad [mm/s]", row=3, col=1, secondary_y=False)
+
                     if yplot_dbv is not None:
-                        plotly_fig.update_yaxes(title_text="Nivel [dBV]", row=2, col=1, secondary_y=True)
+                        plotly_fig.update_yaxes(title_text="Nivel [dBV]", row=3, col=1, secondary_y=True)
                         try:
                             max_db = float(np.nanmax(yplot_dbv)) if len(yplot_dbv) > 0 else 0.0
                             min_db = float(np.nanmin(yplot_dbv)) if len(yplot_dbv) > 0 else 0.0
@@ -10870,21 +11191,41 @@ class MainApp:
                         lower = db_axis_min if db_axis_min is not None else min_db
                         upper = db_axis_max if db_axis_max is not None else max_db
                         if np.isfinite(lower) and np.isfinite(upper) and upper != lower:
-                            plotly_fig.update_yaxes(range=[lower, upper], row=2, col=1, secondary_y=True)
-    
+                            plotly_fig.update_yaxes(range=[lower, upper], row=3, col=1, secondary_y=True)
+
                     if zmin is not None:
-                        plotly_fig.update_xaxes(range=[zmin / freq_scale, zmax / freq_scale], row=2, col=1)
+                        plotly_fig.update_xaxes(range=[zmin / freq_scale, zmax / freq_scale], row=3, col=1)
                     elif fmax_ui and fmax_ui > 0:
-                        plotly_fig.update_xaxes(range=[0.0, float(fmax_ui) / freq_scale], row=2, col=1)
-    
+                        plotly_fig.update_xaxes(range=[0.0, float(fmax_ui) / freq_scale], row=3, col=1)
+
                     plotly_fig.update_layout(
                         template=template_name,
-                        height=650,
+                        height=900,
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-                        margin=dict(l=60, r=40, t=60, b=60),
+                        margin=dict(l=60, r=40, t=60, b=140),
                         hovermode="x unified",
                         title=dict(text="Análisis tiempo / frecuencia", x=0.5),
                     )
+
+                    plotly_fig.add_annotation(
+                        x=0.5,
+                        y=-0.12,
+                        xref="paper",
+                        yref="paper",
+                        text=FILTER_NOTE_TEXT,
+                        showarrow=False,
+                        font=dict(color=annotation_color, size=11),
+                    )
+                    if not time_filter_applied and filter_warning_note:
+                        plotly_fig.add_annotation(
+                            x=0.5,
+                            y=-0.18,
+                            xref="paper",
+                            yref="paper",
+                            text=filter_warning_note,
+                            showarrow=False,
+                            font=dict(color="#f39c12", size=10),
+                        )
     
                     chart = PlotlyChart(plotly_fig, expand=True)
                 except Exception as exc:
