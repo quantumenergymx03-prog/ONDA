@@ -10633,15 +10633,35 @@ class MainApp:
 
 
 
-            # --- Preparación de señales filtradas para visualización ---
+            # --- Gráficas principales ---
 
+            plt.style.use('dark_background' if self.is_dark_mode else 'seaborn-v0_8-whitegrid')
+            plt.rcParams["font.family"] = "DejaVu Sans"
+
+            # Preparar senal de tiempo segun unidad seleccionada
+            unit_mode = self._get_time_display_unit()
+            if unit_mode == "vel_mm":
+                _y_time = self._acc_to_vel_time_mm(acc_segment, t_segment)
+                _ylabel = "Velocidad [mm/s]"
+                _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else "RMS vel: 0.000 mm/s"
+            elif unit_mode == "acc_g":
+                _y_time = acc_segment / 9.80665
+                _ylabel = "Aceleración [g]"
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
+            else:
+                _y_time = acc_segment
+                _ylabel = "Aceleración [m/s²]"
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
+
+            # --- Preparación de señales filtradas para visualización ---
             try:
                 f1_hz_guess = self._get_1x_hz(dom_freq)
             except Exception:
                 f1_hz_guess = None
-            _y_time_filtered = np.array(_y_time, dtype=float, copy=True)
+
             time_filter_applied = False
             filter_warning_note = None
+            _y_time_filtered = np.array(_y_time, dtype=float, copy=True)
             if (
                 _y_time_filtered.size > 0
                 and fs_segment is not None
@@ -10669,25 +10689,6 @@ class MainApp:
             if not time_filter_applied and filter_warning_note is None:
                 filter_warning_note = "No se pudo aplicar el filtrado 1X (verifica RPM y muestreo)."
 
-            # --- Gráficas principales ---
-
-            plt.style.use('dark_background' if self.is_dark_mode else 'seaborn-v0_8-whitegrid')
-            plt.rcParams["font.family"] = "DejaVu Sans"
-
-            # Preparar senal de tiempo segun unidad seleccionada
-            unit_mode = self._get_time_display_unit()
-            if unit_mode == "vel_mm":
-                _y_time = self._acc_to_vel_time_mm(acc_segment, t_segment)
-                _ylabel = "Velocidad [mm/s]"
-                _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else "RMS vel: 0.000 mm/s"
-            elif unit_mode == "acc_g":
-                _y_time = acc_segment / 9.80665
-                _ylabel = "Aceleración [g]"
-                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
-            else:
-                _y_time = acc_segment
-                _ylabel = "Aceleración [m/s²]"
-                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
             # Aplicar filtros visuales de frecuencia (LF y/o límite HF)
             try:
                 fc = float(self.lf_cutoff_field.value) if getattr(self, 'lf_cutoff_field', None) and getattr(self.lf_cutoff_field, 'value', '') else 0.5
